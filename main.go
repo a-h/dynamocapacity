@@ -186,21 +186,15 @@ func getProvisionedAndConsumedMetrics(region, tableName string, day time.Time, p
 	if err != nil {
 		return
 	}
-	if len(provisioned.Datapoints) == 0 {
-		// It's an on-demand table already.
-		return
-	}
 	consumed, err := getMetrics(region, tableName, consumedMetric, day)
 	if err != nil {
 		return
 	}
-	if len(provisioned.Datapoints) != len(consumed.Datapoints) {
-		err = fmt.Errorf("count of provisioned and consumed datapoints didn't match (%d and %d)",
-			len(provisioned.Datapoints),
-			len(consumed.Datapoints))
-		return
+	maxlen := len(provisioned.Datapoints)
+	if len(consumed.Datapoints) > maxlen {
+		maxlen = len(consumed.Datapoints)
 	}
-	metrics = make([]dynamoDBMetric, len(provisioned.Datapoints))
+	metrics = make([]dynamoDBMetric, maxlen)
 	for i, pd := range provisioned.Datapoints {
 		metrics[i].Provisioned = *pd.Sum
 		metrics[i].ProvisionedUnits = *pd.Average
