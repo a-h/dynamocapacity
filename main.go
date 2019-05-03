@@ -7,11 +7,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/pricing"
 )
 
 var tableFlag = flag.String("table", "", "Name of the table to query")
@@ -90,19 +91,83 @@ func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s 
 	for _, m := range writeMetrics {
 		writes += m.Consumed
 	}
-	// Read request units	$0.297 per million read request units
-	s.onDemandRead += 0.297 * (reads / float64(1000000))
-	// Write request units	$1.4846 per million write request units
-	s.onDemandWrite += 1.4864 * (writes / float64(1000000))
 
-	// Read capacity unit (RCU)	$0.0001544 per RCU
+
+	var pricing, err = getPricing()
+
+	if err != nil {
+		return
+	}
+
+	// Read request units (price per million)
+	s.onDemandRead += pricing.onDemandRead * (reads / float64(1000000))
+	// Write request units (price per million)
+	s.onDemandWrite = pricing.onDemandWrite * (writes / float64(1000000))
+
+	// Read capacity unit (RCU)
 	for _, m := range readMetrics {
-		s.provisionedRead += m.ProvisionedUnits * 0.0001544
+		s.provisionedRead += m.ProvisionedUnits * pricing.readCapacityUnit
 	}
-	// Write capacity unit (WCU)	$0.000772 per WCU
+	// Write capacity unit (WCU)
 	for _, m := range writeMetrics {
-		s.provisionedWrite += m.ProvisionedUnits * 0.000772
+		s.provisionedWrite += m.ProvisionedUnits * pricing.writeCapacityUnit
 	}
+	return
+}
+
+type dynamoPricing struct {
+	onDemandRead, onDemandWrite, readCapacityUnit, writeCapacityUnit float64
+}
+
+type dynamoPricingResponse struct {
+	PriceList []string `json:"PriceList"`
+}
+
+type priceDetail struct {
+	Product     product `json:"product"`
+	ServiceCode string  `json:"serviceCode"`
+	Terms       terms   `json:"terms"`
+}
+
+type product struct {
+	ProductFamily string `json:"productFamily"`
+}
+
+type terms struct {
+}
+
+func getPricing() (s dynamoPricing, err error) {
+	// Pricing data only available in 2 regions
+	region := "us-east-1"
+
+	conf := &aws.Config{
+		Region: aws.String(region),
+	}
+	sess, err := session.NewSession(conf)
+	if err != nil {
+		return
+	}
+
+	svc := pricing.New(sess)
+
+	pricingReq := &pricing.GetProductsInput{
+		ServiceCode: aws.String("AmazonDynamoDB"),
+	}
+
+	pricing, err := svc.GetProducts(pricingReq)
+
+	if err != nil {
+		return
+	}
+
+	fmt.Print(pricing.PriceList)
+
+	s.onDemandRead = 0.297
+	s.onDemandWrite = 1.4846
+
+	s.readCapacityUnit = 0.0001544
+	s.writeCapacityUnit = 0.000772
+
 	return
 }
 
