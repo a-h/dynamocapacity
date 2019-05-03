@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/aws/aws-sdk-go/service/dynamodb"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -12,6 +15,7 @@ import (
 )
 
 var tableFlag = flag.String("table", "", "Name of the table to query")
+var allTables = flag.Bool("allTables", false, "Query all tables and produce a summary of potential cost savings")
 var regionFlag = flag.String("region", "eu-west-2", "AWS region name")
 var dayFlag = flag.String("day", "2019-04-01", "Day to base values on")
 
@@ -24,39 +28,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *allTables {
+		showAllTables(*regionFlag, day)
+		return
+	}
+
 	if *tableFlag == "" {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-
-	rm, err := getReadMetrics(*regionFlag, *tableFlag, day)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	wm, err := getWriteMetrics(*regionFlag, *tableFlag, day)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	// fmt.Printf("Reads: %+v\n", rm)
-	// fmt.Printf("Writes: %+v\n", wm)
-	// fmt.Println()
-	onDemandRead, onDemandWrite, provisionedRead, provisionedWrite := costs(rm, wm)
-	fmt.Println("Estimated daily:")
-	fmt.Printf("On Demand Read: $%.5f\n", onDemandRead)
-	fmt.Printf("On Demand Write: $%.5f\n", onDemandWrite)
-	fmt.Printf("Provisioned Read: $%.5f\n", provisionedRead)
-	fmt.Printf("Provisioned Write: $%.5f\n", provisionedWrite)
-	fmt.Println("Estimated monthly:")
-	fmt.Printf("On Demand Read: $%.5f\n", (onDemandRead*365)/12)
-	fmt.Printf("On Demand Write: $%.5f\n", (onDemandWrite*365)/12)
-	fmt.Printf("Provisioned Read: $%.5f\n", (provisionedRead*365)/12)
-	fmt.Printf("Provisioned Write: $%.5f\n", (provisionedWrite*365)/12)
+	showSingleTable(*regionFlag, *tableFlag, day)
 }
 
-func costs(readMetrics, writeMetrics []dynamoDBMetric) (onDemandRead, onDemandWrite float64,
-	provisionedRead, provisionedWrite float64) {
+func showAllTables(region string, day time.Time) {
+	tables, err := getTableNames(region)
+	if err != nil {
+		fmt.Printf("unable to get table names for region %s: %v\n", region, err)
+		os.Exit(1)
+	}
+	var summaries []tableCosts
+	for _, t := range tables {
+		s, err := getTableCosts(region, t, day)
+		if err != nil {
+			if err != nil {
+				fmt.Printf("unable to get summary for %s: %v\n", t, err)
+				os.Exit(1)
+			}
+		}
+		summaries = append(summaries, s)
+		fmt.Println(s.String())
+	}
+
+	var costSaving float64
+	for _, s := range summaries {
+		saving := s.provisionedCost() - s.onDemandCost()
+		if saving > 0 {
+			fmt.Printf("Switch table %s to on-demand to save $%.5f per day\n", s.table, saving)
+			costSaving += saving
+		}
+	}
+	fmt.Println()
+	fmt.Printf("Total saved per day: $%.5f\n", costSaving)
+	fmt.Printf("Total saved per month: $%.5f\n", (costSaving*365)/12)
+}
+
+func showSingleTable(region, table string, day time.Time) {
+	s, err := getTableCosts(region, table, day)
+	if err != nil {
+		fmt.Printf("unable to get summary for %s: %v\n", table, err)
+		os.Exit(1)
+	}
+	fmt.Print(s.String())
+}
+
+func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s tableCosts) {
+	s.table = table
 	var reads, writes float64
 	for _, m := range readMetrics {
 		reads += m.Consumed
@@ -65,18 +91,62 @@ func costs(readMetrics, writeMetrics []dynamoDBMetric) (onDemandRead, onDemandWr
 		writes += m.Consumed
 	}
 	// Read request units	$0.297 per million read request units
-	onDemandRead += 0.297 * (reads / float64(1000000))
+	s.onDemandRead += 0.297 * (reads / float64(1000000))
 	// Write request units	$1.4846 per million write request units
-	onDemandWrite = 0.297 * (reads / float64(1000000))
+	s.onDemandWrite = 0.297 * (reads / float64(1000000))
 
 	// Read capacity unit (RCU)	$0.0001544 per RCU
 	for _, m := range readMetrics {
-		provisionedRead += m.ProvisionedUnits * 0.0001544
+		s.provisionedRead += m.ProvisionedUnits * 0.0001544
 	}
 	// Write capacity unit (WCU)	$0.000772 per WCU
 	for _, m := range writeMetrics {
-		provisionedWrite += m.ProvisionedUnits * 0.000772
+		s.provisionedWrite += m.ProvisionedUnits * 0.000772
 	}
+	return
+}
+
+type tableCosts struct {
+	table                             string
+	onDemandRead, onDemandWrite       float64
+	provisionedRead, provisionedWrite float64
+}
+
+func (tc tableCosts) onDemandCost() float64 {
+	return tc.onDemandRead + tc.onDemandWrite
+}
+
+func (tc tableCosts) provisionedCost() float64 {
+	return tc.provisionedRead + tc.provisionedWrite
+}
+
+func (tc tableCosts) String() string {
+	var b bytes.Buffer
+	b.WriteString(tc.table)
+	b.WriteString("\n")
+	b.WriteString("  Estimated daily:\n")
+	b.WriteString(fmt.Sprintf("    On Demand Read: $%.5f\n", tc.onDemandRead))
+	b.WriteString(fmt.Sprintf("    On Demand Write: $%.5f\n", tc.onDemandWrite))
+	b.WriteString(fmt.Sprintf("    Provisioned Read: $%.5f\n", tc.provisionedRead))
+	b.WriteString(fmt.Sprintf("    Provisioned Write: $%.5f\n", tc.provisionedWrite))
+	b.WriteString("  Estimated monthly:\n")
+	b.WriteString(fmt.Sprintf("    On Demand Read: $%.5f\n", (tc.onDemandRead*365)/12))
+	b.WriteString(fmt.Sprintf("    On Demand Write: $%.5f\n", (tc.onDemandWrite*365)/12))
+	b.WriteString(fmt.Sprintf("    Provisioned Read: $%.5f\n", (tc.provisionedRead*365)/12))
+	b.WriteString(fmt.Sprintf("    Provisioned Write: $%.5f\n", (tc.provisionedWrite*365)/12))
+	return b.String()
+}
+
+func getTableCosts(region, table string, day time.Time) (s tableCosts, err error) {
+	rm, err := getReadMetrics(region, table, day)
+	if err != nil {
+		return
+	}
+	wm, err := getWriteMetrics(region, table, day)
+	if err != nil {
+		return
+	}
+	s = newtableCosts(table, rm, wm)
 	return
 }
 
@@ -116,6 +186,10 @@ func getProvisionedAndConsumedMetrics(region, tableName string, day time.Time, p
 	if err != nil {
 		return
 	}
+	if len(provisioned.Datapoints) == 0 {
+		// It's an on-demand table already.
+		return
+	}
 	consumed, err := getMetrics(region, tableName, consumedMetric, day)
 	if err != nil {
 		return
@@ -135,6 +209,24 @@ func getProvisionedAndConsumedMetrics(region, tableName string, day time.Time, p
 		metrics[i].Consumed = *cd.Sum
 		metrics[i].ConsumedUnits = *cd.Average
 	}
+	return
+}
+
+func getTableNames(region string) (tables []string, err error) {
+	conf := &aws.Config{
+		Region: aws.String(region),
+	}
+	sess, err := session.NewSession(conf)
+	if err != nil {
+		return
+	}
+	svc := dynamodb.New(sess)
+	err = svc.ListTablesPages(&dynamodb.ListTablesInput{}, func(lto *dynamodb.ListTablesOutput, lastPage bool) bool {
+		for _, s := range lto.TableNames {
+			tables = append(tables, *s)
+		}
+		return true // continue
+	})
 	return
 }
 
