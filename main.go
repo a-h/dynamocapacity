@@ -93,7 +93,7 @@ func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s 
 	// Read request units	$0.297 per million read request units
 	s.onDemandRead += 0.297 * (reads / float64(1000000))
 	// Write request units	$1.4846 per million write request units
-	s.onDemandWrite += 0.297 * (writes / float64(1000000))
+	s.onDemandWrite += 1.4864 * (writes / float64(1000000))
 
 	// Read capacity unit (RCU)	$0.0001544 per RCU
 	for _, m := range readMetrics {
