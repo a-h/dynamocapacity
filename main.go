@@ -39,9 +39,9 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	fmt.Printf("Reads: %+v\n", rm)
-	fmt.Printf("Writes: %+v\n", wm)
-	fmt.Println()
+	// fmt.Printf("Reads: %+v\n", rm)
+	// fmt.Printf("Writes: %+v\n", wm)
+	// fmt.Println()
 	onDemandRead, onDemandWrite, provisionedRead, provisionedWrite := costs(rm, wm)
 	fmt.Println("Estimated daily:")
 	fmt.Printf("On Demand Read: $%.5f\n", onDemandRead)
