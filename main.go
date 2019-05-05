@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
+	"github.com/mitchellh/mapstructure"
+
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/session"
 
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
@@ -29,8 +34,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	location := endpoints.AwsPartition().Regions()[*regionFlag].Description()
+
+	pricing, err := getDynamoPricing(location)
+
+	fmt.Printf("%s", pricing)
+	fmt.Println()
+
 	if *allTables {
-		showAllTables(*regionFlag, day)
+		showAllTables(*regionFlag, day, pricing)
 		return
 	}
 
@@ -38,10 +50,10 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	showSingleTable(*regionFlag, *tableFlag, day)
+	showSingleTable(*regionFlag, *tableFlag, day, pricing)
 }
 
-func showAllTables(region string, day time.Time) {
+func showAllTables(region string, day time.Time, pricing dynamoPricing) {
 	tables, err := getTableNames(region)
 	if err != nil {
 		fmt.Printf("unable to get table names for region %s: %v\n", region, err)
@@ -49,7 +61,7 @@ func showAllTables(region string, day time.Time) {
 	}
 	var summaries []tableCosts
 	for _, t := range tables {
-		s, err := getTableCosts(region, t, day)
+		s, err := getTableCosts(region, t, day, pricing)
 		if err != nil {
 			if err != nil {
 				fmt.Printf("unable to get summary for %s: %v\n", t, err)
@@ -73,8 +85,8 @@ func showAllTables(region string, day time.Time) {
 	fmt.Printf("Total saved per month: $%.5f\n", (costSaving*365)/12)
 }
 
-func showSingleTable(region, table string, day time.Time) {
-	s, err := getTableCosts(region, table, day)
+func showSingleTable(region, table string, day time.Time, pricing dynamoPricing) {
+	s, err := getTableCosts(region, table, day, pricing)
 	if err != nil {
 		fmt.Printf("unable to get summary for %s: %v\n", table, err)
 		os.Exit(1)
@@ -82,7 +94,7 @@ func showSingleTable(region, table string, day time.Time) {
 	fmt.Print(s.String())
 }
 
-func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s tableCosts) {
+func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric, pricing dynamoPricing) (s tableCosts) {
 	s.table = table
 	var reads, writes float64
 	for _, m := range readMetrics {
@@ -92,17 +104,10 @@ func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s 
 		writes += m.Consumed
 	}
 
-
-	var pricing, err = getPricing()
-
-	if err != nil {
-		return
-	}
-
-	// Read request units (price per million)
-	s.onDemandRead += pricing.onDemandRead * (reads / float64(1000000))
-	// Write request units (price per million)
-	s.onDemandWrite = pricing.onDemandWrite * (writes / float64(1000000))
+	// Read request units
+	s.onDemandRead += pricing.onDemandRead * reads
+	// Write request units
+	s.onDemandWrite = pricing.onDemandWrite * writes
 
 	// Read capacity unit (RCU)
 	for _, m := range readMetrics {
@@ -116,29 +121,135 @@ func newtableCosts(table string, readMetrics, writeMetrics []dynamoDBMetric) (s 
 }
 
 type dynamoPricing struct {
-	onDemandRead, onDemandWrite, readCapacityUnit, writeCapacityUnit float64
-}
-
-type dynamoPricingResponse struct {
-	PriceList []string `json:"PriceList"`
+	location                            string
+	onDemandRead, onDemandWrite         float64
+	readCapacityUnit, writeCapacityUnit float64
 }
 
 type priceDetail struct {
-	Product     product `json:"product"`
-	ServiceCode string  `json:"serviceCode"`
-	Terms       terms   `json:"terms"`
+	Product     product
+	ServiceCode string
+	Terms       terms
 }
 
 type product struct {
-	ProductFamily string `json:"productFamily"`
+	ProductFamily string
+	Sku           string
+	Attributes    attributes
+}
+
+type attributes struct {
+	Location string
 }
 
 type terms struct {
+	OnDemand map[string]interface{}
 }
 
-func getPricing() (s dynamoPricing, err error) {
-	// Pricing data only available in 2 regions
-	region := "us-east-1"
+type onDemandTerms struct {
+	PriceDimensions map[string]interface{}
+}
+
+type onDemandDetails struct {
+	Description  string
+	PricePerUnit pricePerUnit
+}
+
+type pricePerUnit struct {
+	Usd string
+}
+
+func parseProduct(product aws.JSONValue) (float64, error) {
+	var result priceDetail
+	mapstructure.Decode(product, &result)
+
+	if len(result.Terms.OnDemand) > 1 {
+		return 0, errors.New("More than one product term found")
+	}
+
+	for _, v := range result.Terms.OnDemand {
+
+		var result2 onDemandTerms
+		mapstructure.Decode(v, &result2)
+
+		for _, v2 := range result2.PriceDimensions {
+
+			var result3 onDemandDetails
+
+			mapstructure.Decode(v2, &result3)
+
+			price, err := strconv.ParseFloat(result3.PricePerUnit.Usd, 64)
+
+			if err != nil {
+				fmt.Printf("Couldn't find any on-demand pricing")
+			}
+
+			// Return first non-zero to ignore any free-tier pricing
+			if price > 0.00 {
+				return price, nil
+			}
+
+		}
+	}
+
+	return 0, errors.New("No product data found")
+}
+
+func getDynamoPricing(location string) (s dynamoPricing, err error) {
+	provisionedReadGroupDescription := "DynamoDB Provisioned Read Units"
+	provisionedWriteGroupDescription := "DynamoDB Provisioned Write Units"
+	onDemandReadGroupDescription := "DynamoDB PayPerRequest Read Request Units"
+	onDemandWriteGroupDescription := "DynamoDB PayPerRequest Write Request Units"
+
+	readCapacityUnit, err := getPrice(location, provisionedReadGroupDescription)
+
+	if err != nil {
+		return
+	}
+
+	writeCapacityUnit, err := getPrice(location, provisionedWriteGroupDescription)
+
+	if err != nil {
+		return
+	}
+
+	onDemandRead, err := getPrice(location, onDemandReadGroupDescription)
+
+	if err != nil {
+		return
+	}
+
+	onDemandWrite, err := getPrice(location, onDemandWriteGroupDescription)
+
+	if err != nil {
+		return
+	}
+
+	s.location = location
+	s.readCapacityUnit = readCapacityUnit
+	s.writeCapacityUnit = writeCapacityUnit
+	s.onDemandRead = onDemandRead
+	s.onDemandWrite = onDemandWrite
+
+	return s, nil
+}
+
+func (dp dynamoPricing) String() string {
+	var b bytes.Buffer
+	b.WriteString(fmt.Sprintf("Current prices for %s:\n", dp.location))
+	b.WriteString(fmt.Sprintf("  On Demand:\n"))
+	b.WriteString(fmt.Sprintf("    Reads:   $%.5f (per million)\n", dp.onDemandRead*float64(1000000)))
+	b.WriteString(fmt.Sprintf("    Writes:  $%.5f (per million)\n", dp.onDemandWrite*float64(1000000)))
+	b.WriteString(fmt.Sprintf("  Provisioned:\n"))
+	b.WriteString(fmt.Sprintf("    RCUs:    $%.5f\n", dp.readCapacityUnit))
+	b.WriteString(fmt.Sprintf("    WCUs:    $%.5f\n", dp.writeCapacityUnit))
+	return b.String()
+}
+
+func getPrice(location, groupDescription string) (res float64, err error) {
+	// Pricing data endpoint only available in 2 regions
+	// the other is ap-south-1
+	region := endpoints.UsEast1RegionID
 
 	conf := &aws.Config{
 		Region: aws.String(region),
@@ -150,8 +261,22 @@ func getPricing() (s dynamoPricing, err error) {
 
 	svc := pricing.New(sess)
 
+	var priceFilters []*pricing.Filter
+	priceFilters = append(priceFilters, &pricing.Filter{
+		Type:  aws.String(pricing.FilterTypeTermMatch),
+		Field: aws.String("location"),
+		Value: aws.String(location),
+	})
+
+	priceFilters = append(priceFilters, &pricing.Filter{
+		Type:  aws.String(pricing.FilterTypeTermMatch),
+		Field: aws.String("groupDescription"),
+		Value: aws.String(groupDescription),
+	})
+
 	pricingReq := &pricing.GetProductsInput{
 		ServiceCode: aws.String("AmazonDynamoDB"),
+		Filters:     priceFilters,
 	}
 
 	pricing, err := svc.GetProducts(pricingReq)
@@ -160,13 +285,17 @@ func getPricing() (s dynamoPricing, err error) {
 		return
 	}
 
-	fmt.Print(pricing.PriceList)
+	for _, product := range pricing.PriceList {
+		res, err := parseProduct(product)
 
-	s.onDemandRead = 0.297
-	s.onDemandWrite = 1.4846
+		if err != nil {
+			fmt.Print("Failed to parse product")
+			os.Exit(1)
+		} else {
+			return res, nil
+		}
 
-	s.readCapacityUnit = 0.0001544
-	s.writeCapacityUnit = 0.000772
+	}
 
 	return
 }
@@ -202,7 +331,7 @@ func (tc tableCosts) String() string {
 	return b.String()
 }
 
-func getTableCosts(region, table string, day time.Time) (s tableCosts, err error) {
+func getTableCosts(region, table string, day time.Time, pricing dynamoPricing) (s tableCosts, err error) {
 	rm, err := getReadMetrics(region, table, day)
 	if err != nil {
 		return
@@ -211,7 +340,8 @@ func getTableCosts(region, table string, day time.Time) (s tableCosts, err error
 	if err != nil {
 		return
 	}
-	s = newtableCosts(table, rm, wm)
+	s = newtableCosts(table, rm, wm, pricing)
+
 	return
 }
 
