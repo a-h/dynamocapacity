@@ -35,11 +35,11 @@ func main() {
 	}
 
 	location := endpoints.AwsPartition().Regions()[*regionFlag].Description()
-
 	pricing, err := getDynamoPricing(location)
-
-	fmt.Printf("%s", pricing)
-	fmt.Println()
+	if err != nil {
+		fmt.Printf("failed to fetch current pricing\n")
+		os.Exit(1)
+	}
 
 	if *allTables {
 		showAllTables(*regionFlag, day, pricing)
@@ -159,29 +159,40 @@ type pricePerUnit struct {
 	Usd string
 }
 
-func parseProduct(product aws.JSONValue) (float64, error) {
+func parseProduct(product aws.JSONValue) (pice float64, err error) {
 	var result priceDetail
-	mapstructure.Decode(product, &result)
+	err = mapstructure.Decode(product, &result)
+	if err != nil {
+		return
+	}
 
 	if len(result.Terms.OnDemand) > 1 {
-		return 0, errors.New("More than one product term found")
+		return 0, errors.New("more than one product term found")
 	}
 
 	for _, v := range result.Terms.OnDemand {
 
 		var result2 onDemandTerms
-		mapstructure.Decode(v, &result2)
+		err = mapstructure.Decode(v, &result2)
+		if err != nil {
+			return
+		}
 
 		for _, v2 := range result2.PriceDimensions {
 
 			var result3 onDemandDetails
 
-			mapstructure.Decode(v2, &result3)
+			err = mapstructure.Decode(v2, &result3)
+			if err != nil {
+				return
+			}
 
 			price, err := strconv.ParseFloat(result3.PricePerUnit.Usd, 64)
 
 			if err != nil {
-				fmt.Printf("Couldn't find any on-demand pricing")
+				err = fmt.Errorf("failed to parse on-demand pricing: %v", err)
+				fmt.Println(err)
+				return 0, err
 			}
 
 			// Return first non-zero to ignore any free-tier pricing
@@ -192,7 +203,7 @@ func parseProduct(product aws.JSONValue) (float64, error) {
 		}
 	}
 
-	return 0, errors.New("No product data found")
+	return 0, errors.New("no product data found")
 }
 
 func getDynamoPricing(location string) (s dynamoPricing, err error) {
@@ -202,25 +213,21 @@ func getDynamoPricing(location string) (s dynamoPricing, err error) {
 	onDemandWriteGroupDescription := "DynamoDB PayPerRequest Write Request Units"
 
 	readCapacityUnit, err := getPrice(location, provisionedReadGroupDescription)
-
 	if err != nil {
 		return
 	}
 
 	writeCapacityUnit, err := getPrice(location, provisionedWriteGroupDescription)
-
 	if err != nil {
 		return
 	}
 
 	onDemandRead, err := getPrice(location, onDemandReadGroupDescription)
-
 	if err != nil {
 		return
 	}
 
 	onDemandWrite, err := getPrice(location, onDemandWriteGroupDescription)
-
 	if err != nil {
 		return
 	}
@@ -231,7 +238,7 @@ func getDynamoPricing(location string) (s dynamoPricing, err error) {
 	s.onDemandRead = onDemandRead
 	s.onDemandWrite = onDemandWrite
 
-	return s, nil
+	return
 }
 
 func (dp dynamoPricing) String() string {
@@ -289,11 +296,11 @@ func getPrice(location, groupDescription string) (res float64, err error) {
 		res, err := parseProduct(product)
 
 		if err != nil {
-			fmt.Print("Failed to parse product")
-			os.Exit(1)
-		} else {
-			return res, nil
+			err = fmt.Errorf("failed to parse product")
+			return 0, err
 		}
+
+		return res, nil
 
 	}
 
