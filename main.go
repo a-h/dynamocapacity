@@ -23,15 +23,19 @@ import (
 var tableFlag = flag.String("table", "", "Name of the table to query")
 var allTables = flag.Bool("allTables", false, "Query all tables and produce a summary of potential cost savings")
 var regionFlag = flag.String("region", "eu-west-2", "AWS region name")
-var dayFlag = flag.String("day", "2019-04-01", "Day to base values on")
+var dayFlag = flag.String("day", "", "Day to base values on, defaults to 7 days ago")
 
 func main() {
 	flag.Parse()
 
-	day, err := time.Parse("2006-01-02", *dayFlag)
-	if err != nil {
-		fmt.Printf("unexpected date format: %v\n", err)
-		os.Exit(1)
+	day := time.Now().Add(-(time.Hour * 24 * 7)).Round(time.Hour * 24)
+	if *dayFlag != "" {
+		var err error
+		day, err = time.Parse("2006-01-02", *dayFlag)
+		if err != nil {
+			fmt.Printf("unexpected date format: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	location := endpoints.AwsPartition().Regions()[*regionFlag].Description()
